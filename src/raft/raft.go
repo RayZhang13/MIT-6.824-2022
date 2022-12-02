@@ -328,6 +328,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// For Candidates. If AppendEntries RPC received from new leader: convert to follower
+	if rf.state == CandidateState && rf.currentTerm == args.Term {
+		rf.state = FollowerState
+		Debug(dLog2, "S%d Convert from candidate to follower at T%d.", rf.me, rf.currentTerm)
+	}
+
 	rf.checkTerm(args.Term)
 	reply.Term = rf.currentTerm
 
