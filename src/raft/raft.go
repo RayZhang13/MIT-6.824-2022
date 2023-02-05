@@ -39,10 +39,13 @@ const (
 	LeaderState
 )
 
-const TickInterval time.Duration = 10
-const HeartbeatInterval time.Duration = 200
-const HeartbeatTimeout time.Duration = 400
-const ElectionTimeout time.Duration = 1000
+// These constants are all in milliseconds.
+const TickInterval int64 = 30          // Loop interval for ticker and applyLogsLoop. Mostly for checking timeouts.
+const HeartbeatInterval int64 = 100    // Interval between heartbeats. Broadcast heartbeats when timeout as a leader.
+const BaseHeartbeatTimeout int64 = 300 // Lower bound of heartbeat timeout. Election is raised when timeout as a follower.
+const BaseElectionTimeout int64 = 1000 // Lower bound of election timeout. Another election is raised when timeout as a candidate.
+
+const RandomFactor float64 = 0.8 // Factor to control upper bound of heartbeat timeouts and election timeouts.
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -77,6 +80,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	leaderId      int // the leader server that current server recognizes
 	state         RaftState
 	heartbeatTime time.Time
 	electionTime  time.Time
@@ -121,13 +125,13 @@ func max(a, b int) int {
 }
 
 func randElectionTimeout() time.Duration {
-	time := time.Duration(rand.Int63()) % ElectionTimeout
-	return time + ElectionTimeout
+	extraTime := int64(float64(rand.Int63()%BaseElectionTimeout) * RandomFactor)
+	return time.Duration(extraTime+BaseElectionTimeout) * time.Millisecond
 }
 
 func randHeartbeatTimeout() time.Duration {
-	time := time.Duration(rand.Int63()) % HeartbeatTimeout
-	return time + HeartbeatTimeout
+	extraTime := int64(float64(rand.Int63()%BaseHeartbeatTimeout) * RandomFactor)
+	return time.Duration(extraTime+BaseHeartbeatTimeout) * time.Millisecond
 }
 
 // return currentTerm and whether this server
@@ -251,13 +255,18 @@ func (logEntries LogEntries) lastLogInfo() (index, term int) {
 }
 
 func (logEntries LogEntries) getSlice(startIndex, endIndex int) LogEntries {
-	if startIndex > len(logEntries) || startIndex <= 0 {
-		log.Panic("LogEntries.getSlice: startIndex out of range.\n")
+	if startIndex <= 0 {
+		Debug(dError, "LogEntries.getSlice: startIndex out of range. startIndex: %d, len: %d.",
+			startIndex, len(logEntries))
+		log.Panic("LogEntries.getSlice: startIndex out of range. \n")
 	}
-	if endIndex > len(logEntries)+1 || endIndex <= 0 {
+	if endIndex > len(logEntries)+1 {
+		Debug(dError, "LogEntries.getSlice: endIndex out of range. endIndex: %d, len: %d.",
+			endIndex, len(logEntries))
 		log.Panic("LogEntries.getSlice: endIndex out of range.\n")
 	}
 	if startIndex > endIndex {
+		Debug(dError, "LogEntries.getSlice: startIndex > endIndex. (%d > %d)", startIndex, endIndex)
 		log.Panic("LogEntries.getSlice: startIndex > endIndex.\n")
 	}
 	return logEntries[startIndex-1 : endIndex-1]
@@ -273,6 +282,7 @@ func (rf *Raft) checkTerm(term int) bool {
 		rf.state = FollowerState
 		rf.currentTerm = term
 		rf.votedFor = -1
+		rf.leaderId = -1
 		return true
 	}
 	return false
@@ -340,6 +350,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	Debug(dTimer, "S%d Resetting ELT, wait for next potential heartbeat timeout.", rf.me)
 	rf.setElectionTimeout(randHeartbeatTimeout())
 
+	rf.leaderId = args.LeaderId
+
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntry(args.PrevLogIndex).Term {
 		Debug(dLog2, "S%d Prev log entries do not match. Ask leader to retry.", rf.me)
@@ -353,13 +365,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	if args.LeaderCommit > rf.commitIndex {
+		Debug(dCommit, "S%d Get higher LC at T%d, updating commitIndex. (%d < %d)",
+			rf.me, rf.currentTerm, rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		Debug(dCommit, "S%d Updated commitIndex at T%d. CI: %d.", rf.me, rf.currentTerm, rf.commitIndex)
+	}
 	Debug(dLog2, "S%d <- S%d Append entries success. Saved logs: %v.", rf.me, args.LeaderId, args.Entries)
 	reply.Success = true
 }
 
 func (rf *Raft) sendEntries(isHeartbeat bool) {
 	Debug(dTimer, "S%d Resetting HBT, wait for next heartbeat broadcast.", rf.me)
-	rf.setHeartbeatTimeout(HeartbeatInterval)
+	rf.setHeartbeatTimeout(time.Duration(HeartbeatInterval) * time.Millisecond)
 	Debug(dTimer, "S%d Resetting ELT, wait for next potential heartbeat timeout.", rf.me)
 	rf.setElectionTimeout(randHeartbeatTimeout())
 	lastLogIndex, _ := rf.log.lastLogInfo()
@@ -418,10 +436,29 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 				newMatch := args.PrevLogIndex + len(args.Entries)
 				rf.nextIndex[server] = max(newNext, rf.nextIndex[server])
 				rf.matchIndex[server] = max(newMatch, rf.matchIndex[server])
+				// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+				// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
+				for N := len(rf.log); N > rf.commitIndex && rf.log.getEntry(N).Term == rf.currentTerm; N-- {
+					count := 1
+					for peer, matchIndex := range rf.matchIndex {
+						if peer == rf.me {
+							continue
+						}
+						if matchIndex >= N {
+							count++
+						}
+					}
+					if count > len(rf.peers)/2 {
+						rf.commitIndex = N
+						Debug(dCommit, "S%d Updated commitIndex at T%d for majority consensus. CI: %d.", rf.me, rf.currentTerm, rf.commitIndex)
+						break
+					}
+				}
 			} else {
 				// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
-				rf.nextIndex[server]--
-				rf.matchIndex[server]--
+				if rf.nextIndex[server] > 1 {
+					rf.nextIndex[server]--
+				}
 				lastLogIndex, _ := rf.log.lastLogInfo()
 				nextIndex := rf.nextIndex[server]
 				if lastLogIndex >= nextIndex {
@@ -562,6 +599,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != LeaderState {
+		return -1, -1, false
+	}
+	logEntry := LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+	}
+	rf.log = append(rf.log, logEntry)
+	index = len(rf.log)
+	term = rf.currentTerm
+	Debug(dLog, "S%d Add command at T%d. LI: %d, Command: %v\n", rf.me, term, index, command)
+	rf.sendEntries(false)
 
 	return index, term, isLeader
 }
@@ -587,6 +638,7 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+// The routine also broadcasts heartbeats and appies logs periodically.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 
@@ -605,20 +657,44 @@ func (rf *Raft) ticker() {
 			rf.raiseElection()
 		}
 		rf.mu.Unlock()
-		time.Sleep(TickInterval * time.Millisecond)
+		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
 	}
 }
 
 func (rf *Raft) setElectionTimeout(timeout time.Duration) {
 	t := time.Now()
-	t = t.Add(timeout * time.Millisecond)
+	t = t.Add(timeout)
 	rf.electionTime = t
 }
 
 func (rf *Raft) setHeartbeatTimeout(timeout time.Duration) {
 	t := time.Now()
-	t = t.Add(timeout * time.Millisecond)
+	t = t.Add(timeout)
 	rf.heartbeatTime = t
+}
+
+func (rf *Raft) applyLogsLoop(applyCh chan ApplyMsg) {
+	for !rf.killed() {
+		// Apply logs periodically until the last committed index.
+		rf.mu.Lock()
+		// To avoid the apply operation getting blocked with the lock held,
+		// use a slice to store all committed msgs to apply, and apply them only after unlocked
+		appliedMsgs := []ApplyMsg{}
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			appliedMsgs = append(appliedMsgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log.getEntry(rf.lastApplied).Command,
+				CommandIndex: rf.lastApplied,
+			})
+			Debug(dLog2, "S%d Applying log at T%d. LA: %d, CI: %d.", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
+		}
+		rf.mu.Unlock()
+		for _, msg := range appliedMsgs {
+			applyCh <- msg
+		}
+		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -639,6 +715,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.leaderId = -1
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.state = FollowerState
@@ -657,6 +734,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// Apply logs periodically until the last committed index to make sure state machine is up to date.
+	go rf.applyLogsLoop(applyCh)
 
 	return rf
 }
