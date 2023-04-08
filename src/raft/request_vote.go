@@ -134,6 +134,11 @@ func (rf *Raft) candidateRequestVote(voteCount *int, args *RequestVoteArgs, once
 		}
 		// If AppendEntries RPC received from new leader: convert to follower
 		rf.checkTerm(reply.Term)
+		if rf.currentTerm != args.Term {
+			Debug(dWarn, "S%d Term has changed after the vote request, vote reply discarded."+
+				"requestTerm: %d, currentTerm: %d.", rf.me, args.Term, rf.currentTerm)
+			return
+		}
 		if reply.VoteGranted {
 			*voteCount++
 			Debug(dVote, "S%d <- S%d Get a yes vote at T%d.", rf.me, server, rf.currentTerm)
