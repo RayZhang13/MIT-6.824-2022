@@ -2,7 +2,8 @@ package raft
 
 import "time"
 
-// as each Raft peer becomes aware that successive log entries are
+// ApplyMsg is the structure used to apply log entries to the server.
+// As each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
@@ -23,9 +24,8 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-// The routine also broadcasts heartbeats and appies logs periodically.
+// The ticker go routine starts a new election if this peer hasn't received heartbeats recently.
+// The routine also broadcasts heartbeats and applies logs periodically.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 
@@ -53,8 +53,8 @@ func (rf *Raft) applyLogsLoop(applyCh chan ApplyMsg) {
 		// Apply logs periodically until the last committed index.
 		rf.mu.Lock()
 		// To avoid the apply operation getting blocked with the lock held,
-		// use a slice to store all committed msgs to apply, and apply them only after unlocked
-		appliedMsgs := []ApplyMsg{}
+		// use a slice to store all committed messages to apply, and apply them only after unlocked
+		var appliedMsgs []ApplyMsg
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			appliedMsgs = append(appliedMsgs, ApplyMsg{

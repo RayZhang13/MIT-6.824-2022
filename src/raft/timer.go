@@ -6,10 +6,12 @@ import (
 )
 
 // These constants are all in milliseconds.
-const TickInterval int64 = 30          // Loop interval for ticker and applyLogsLoop. Mostly for checking timeouts.
-const HeartbeatInterval int64 = 100    // Interval between heartbeats. Broadcast heartbeats when timeout as a leader.
-const BaseHeartbeatTimeout int64 = 300 // Lower bound of heartbeat timeout. Election is raised when timeout as a follower.
-const BaseElectionTimeout int64 = 1000 // Lower bound of election timeout. Another election is raised when timeout as a candidate.
+const (
+	TickInterval         int64 = 30   // Loop interval for ticker and applyLogsLoop. Mostly for checking timeouts.
+	HeartbeatInterval    int64 = 100  // Interval between heartbeats. Broadcast heartbeats when timeout as a leader.
+	BaseHeartbeatTimeout int64 = 300  // Lower bound of heartbeat timeout. Election is raised when timeout as a follower.
+	BaseElectionTimeout  int64 = 1000 // Lower bound of election timeout. Another election is raised when timeout as a candidate.
+)
 
 const RandomFactor float64 = 0.8 // Factor to control upper bound of heartbeat timeouts and election timeouts.
 

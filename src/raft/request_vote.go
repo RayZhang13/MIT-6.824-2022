@@ -2,7 +2,7 @@ package raft
 
 import "sync"
 
-// example RequestVote RPC arguments structure.
+// RequestVoteArgs is the RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
@@ -12,7 +12,7 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // term of candidate’s last log entry (§5.4)
 }
 
-// example RequestVote RPC reply structure.
+// RequestVoteReply is the RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
@@ -20,7 +20,7 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidate received vote
 }
 
-// example code to send a RequestVote RPC to a server.
+// code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
 // fills in *reply with RPC reply, so caller should
@@ -38,7 +38,7 @@ type RequestVoteReply struct {
 // can't be reached, a lost request, or a lost reply.
 //
 // Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
+// handler function on the server side does not return.  Thus, there
 // is no need to implement your own timeouts around Call().
 //
 // look at the comments in ../labrpc/labrpc.go for more details.
@@ -52,12 +52,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-// example RequestVote RPC handler.
+// RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
@@ -78,14 +73,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If votedFor is null or candidateId,
 	// and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	lastLogIndex, lastLogTerm := rf.log.lastLogInfo()
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-		(lastLogTerm < args.LastLogTerm ||
-			(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex)) {
-		Debug(dVote, "S%d Granting vote to S%d at T%d.", rf.me, args.CandidateId, args.Term)
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		Debug(dTimer, "S%d Resetting ELT, wait for next potential election timeout.", rf.me)
-		rf.setElectionTimeout(randElectionTimeout())
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		if lastLogTerm < args.LastLogTerm ||
+			(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
+			Debug(dVote, "S%d Granting vote to S%d at T%d.", rf.me, args.CandidateId, args.Term)
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			rf.persist()
+			Debug(dTimer, "S%d Resetting ELT, wait for next potential election timeout.", rf.me)
+			rf.setElectionTimeout(randElectionTimeout())
+		} else {
+			Debug(dVote, "S%d Candidate's log not up-to-date, rejecting the vote. LLI: %d, %d. LLT: %d, %d.",
+				rf.me, lastLogIndex, args.LastLogIndex, lastLogTerm, args.LastLogTerm)
+		}
+	} else {
+		Debug(dVote, "S%d Already voted for S%d, rejecting the vote.", rf.me, rf.votedFor)
 	}
 }
 
@@ -96,6 +98,7 @@ func (rf *Raft) raiseElection() {
 	Debug(dTerm, "S%d Starting a new term. Now at T%d.", rf.me, rf.currentTerm)
 	// Vote for self
 	rf.votedFor = rf.me
+	rf.persist()
 	// Reset election timer
 	rf.setElectionTimeout(randElectionTimeout())
 	Debug(dTimer, "S%d Resetting ELT because of election, wait for next potential election timeout.", rf.me)
@@ -134,7 +137,7 @@ func (rf *Raft) candidateRequestVote(voteCount *int, args *RequestVoteArgs, once
 		if reply.VoteGranted {
 			*voteCount++
 			Debug(dVote, "S%d <- S%d Get a yes vote at T%d.", rf.me, server, rf.currentTerm)
-			// If votes received from majority of servers: become leader
+			// If votes received from the majority of servers: become leader
 			if *voteCount > len(rf.peers)/2 {
 				once.Do(func() {
 					Debug(dLeader, "S%d Received majority votes at T%d. Become leader.", rf.me, rf.currentTerm)

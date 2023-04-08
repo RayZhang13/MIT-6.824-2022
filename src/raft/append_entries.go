@@ -2,6 +2,8 @@ package raft
 
 import "time"
 
+// AppendEntriesArgs is the AppendEntries RPC arguments structure.
+// field names must start with capital letters!
 type AppendEntriesArgs struct {
 	Term         int        // leader’s term
 	LeaderId     int        // with leaderId follower can redirect clients
@@ -11,9 +13,24 @@ type AppendEntriesArgs struct {
 	LeaderCommit int        // leader's commitIndex
 }
 
+// AppendEntriesReply is the AppendEntries RPC reply structure.
+// field names must start with capital letters!
 type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
+	XTerm   int  // term in the conflicting entry (if any)
+	XIndex  int  // index of first entry with that term (if any)
+	XLen    int  // log length
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+// code to send a AppendEntries RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -50,16 +67,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntry(args.PrevLogIndex).Term {
-		Debug(dLog2, "S%d Prev log entries do not match. Ask leader to retry.", rf.me)
+		Debug(dDrop, "S%d Prev log entries do not match. Ask leader to retry.", rf.me)
+		reply.XLen = len(rf.log)
+		reply.XTerm = rf.log.getEntry(args.PrevLogIndex).Term
+		reply.XIndex, _ = rf.log.getBoundsWithTerm(reply.XTerm)
 		return
 	}
 	// If an existing entry conflicts with a new one (same index but different terms),
 	// delete the existing entry and all that follow it (§5.3)
 	for i, entry := range args.Entries {
 		if rf.log.getEntry(i+1+args.PrevLogIndex).Term != entry.Term {
+			Debug(dLog2, "S%d Running into conflict with existing entries at T%d. conflictLogs: %v, startIndex: %d.",
+				rf.me, rf.currentTerm, args.Entries[i:], i+1+args.PrevLogIndex)
 			rf.log = append(rf.log.getSlice(1, i+1+args.PrevLogIndex), args.Entries[i:]...)
 			break
 		}
+	}
+	Debug(dLog2, "S%d <- S%d Append entries success. Saved logs: %v.", rf.me, args.LeaderId, args.Entries)
+	if len(args.Entries) > 0 {
+		rf.persist()
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		Debug(dCommit, "S%d Get higher LC at T%d, updating commitIndex. (%d < %d)",
@@ -67,7 +93,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 		Debug(dCommit, "S%d Updated commitIndex at T%d. CI: %d.", rf.me, rf.currentTerm, rf.commitIndex)
 	}
-	Debug(dLog2, "S%d <- S%d Append entries success. Saved logs: %v.", rf.me, args.LeaderId, args.Entries)
 	reply.Success = true
 }
 
@@ -89,12 +114,7 @@ func (rf *Raft) sendEntries(isHeartbeat bool) {
 			PrevLogTerm:  rf.log.getEntry(nextIndex - 1).Term,
 			LeaderCommit: rf.commitIndex,
 		}
-		if isHeartbeat {
-			args.Entries = make([]LogEntry, 0)
-			Debug(dLog, "S%d -> S%d Sending heartbeat at T%d. PLI: %d, PLT: %d, LC: %d.",
-				rf.me, peer, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
-			go rf.leaderSendEntries(args, peer)
-		} else if lastLogIndex >= nextIndex {
+		if lastLogIndex >= nextIndex {
 			// If last log index ≥ nextIndex for a follower:
 			// send AppendEntries RPC with log entries starting at nextIndex
 			entries := make([]LogEntry, lastLogIndex-nextIndex+1)
@@ -104,6 +124,11 @@ func (rf *Raft) sendEntries(isHeartbeat bool) {
 				rf.me, peer, rf.currentTerm, args.PrevLogIndex,
 				args.PrevLogTerm, args.LeaderCommit, args.Entries,
 			)
+			go rf.leaderSendEntries(args, peer)
+		} else if isHeartbeat {
+			args.Entries = make([]LogEntry, 0)
+			Debug(dLog, "S%d -> S%d Sending heartbeat at T%d. PLI: %d, PLT: %d, LC: %d.",
+				rf.me, peer, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 			go rf.leaderSendEntries(args, peer)
 		}
 	}
@@ -124,52 +149,66 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 		if rf.checkTerm(reply.Term) {
 			return
 		}
-		if rf.currentTerm == args.Term {
-			// If successful: update nextIndex and matchIndex for follower (§5.3)
-			if reply.Success {
-				Debug(dLog, "S%d <- S%d Log entries in sync at T%d.", rf.me, server, rf.currentTerm)
-				newNext := args.PrevLogIndex + 1 + len(args.Entries)
-				newMatch := args.PrevLogIndex + len(args.Entries)
-				rf.nextIndex[server] = max(newNext, rf.nextIndex[server])
-				rf.matchIndex[server] = max(newMatch, rf.matchIndex[server])
-				// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
-				// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
-				for N := len(rf.log); N > rf.commitIndex && rf.log.getEntry(N).Term == rf.currentTerm; N-- {
-					count := 1
-					for peer, matchIndex := range rf.matchIndex {
-						if peer == rf.me {
-							continue
-						}
-						if matchIndex >= N {
-							count++
-						}
+		if rf.currentTerm != args.Term {
+			Debug(dWarn, "S%d Term has changed after the append request, send entry reply discarded."+
+				"requestTerm: %d, currentTerm: %d.", rf.me, args.Term, rf.currentTerm)
+			return
+		}
+		// If successful: update nextIndex and matchIndex for follower (§5.3)
+		if reply.Success {
+			Debug(dLog, "S%d <- S%d Log entries in sync at T%d.", rf.me, server, rf.currentTerm)
+			newNext := args.PrevLogIndex + 1 + len(args.Entries)
+			newMatch := args.PrevLogIndex + len(args.Entries)
+			rf.nextIndex[server] = max(newNext, rf.nextIndex[server])
+			rf.matchIndex[server] = max(newMatch, rf.matchIndex[server])
+			// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+			// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
+			for N := len(rf.log); N > rf.commitIndex && rf.log.getEntry(N).Term == rf.currentTerm; N-- {
+				count := 1
+				for peer, matchIndex := range rf.matchIndex {
+					if peer == rf.me {
+						continue
 					}
-					if count > len(rf.peers)/2 {
-						rf.commitIndex = N
-						Debug(dCommit, "S%d Updated commitIndex at T%d for majority consensus. CI: %d.", rf.me, rf.currentTerm, rf.commitIndex)
-						break
+					if matchIndex >= N {
+						count++
 					}
 				}
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = N
+					Debug(dCommit, "S%d Updated commitIndex at T%d for majority consensus. CI: %d.", rf.me, rf.currentTerm, rf.commitIndex)
+					break
+				}
+			}
+		} else {
+			// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
+			// the optimization that backs up nextIndex by more than one entry at a time
+			if reply.XTerm == -1 {
+				// follower's log is too short
+				rf.nextIndex[server] = reply.XLen + 1
 			} else {
-				// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
-				if rf.nextIndex[server] > 1 {
-					rf.nextIndex[server]--
+				_, maxIndex := rf.log.getBoundsWithTerm(reply.XTerm)
+				if maxIndex != -1 {
+					// leader has XTerm
+					rf.nextIndex[server] = maxIndex
+				} else {
+					// leader doesn't have XTerm
+					rf.nextIndex[server] = reply.XIndex
 				}
-				lastLogIndex, _ := rf.log.lastLogInfo()
-				nextIndex := rf.nextIndex[server]
-				if lastLogIndex >= nextIndex {
-					Debug(dLog, "S%d <- S%d Inconsistent logs, retrying.", rf.me, server)
-					entries := make([]LogEntry, lastLogIndex-nextIndex+1)
-					copy(entries, rf.log.getSlice(nextIndex, lastLogIndex+1))
-					newArg := &AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PrevLogIndex: nextIndex - 1,
-						PrevLogTerm:  rf.log.getEntry(nextIndex - 1).Term,
-						Entries:      entries,
-					}
-					go rf.leaderSendEntries(newArg, server)
+			}
+			lastLogIndex, _ := rf.log.lastLogInfo()
+			nextIndex := rf.nextIndex[server]
+			if lastLogIndex >= nextIndex {
+				Debug(dLog, "S%d <- S%d Inconsistent logs, retrying.", rf.me, server)
+				entries := make([]LogEntry, lastLogIndex-nextIndex+1)
+				copy(entries, rf.log.getSlice(nextIndex, lastLogIndex+1))
+				newArg := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: nextIndex - 1,
+					PrevLogTerm:  rf.log.getEntry(nextIndex - 1).Term,
+					Entries:      entries,
 				}
+				go rf.leaderSendEntries(newArg, server)
 			}
 		}
 	}
