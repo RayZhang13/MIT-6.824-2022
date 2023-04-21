@@ -72,7 +72,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If votedFor is null or candidateId,
 	// and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	lastLogIndex, lastLogTerm := rf.log.lastLogInfo()
+	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		if lastLogTerm < args.LastLogTerm ||
 			(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
@@ -102,7 +102,7 @@ func (rf *Raft) raiseElection() {
 	// Reset election timer
 	rf.setElectionTimeout(randElectionTimeout())
 	Debug(dTimer, "S%d Resetting ELT because of election, wait for next potential election timeout.", rf.me)
-	lastLogIndex, lastLogTerm := rf.log.lastLogInfo()
+	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -132,13 +132,13 @@ func (rf *Raft) candidateRequestVote(voteCount *int, args *RequestVoteArgs, once
 			Debug(dVote, "S%d Term is lower, invalid vote reply. (%d < %d)", rf.me, reply.Term, rf.currentTerm)
 			return
 		}
-		// If AppendEntries RPC received from new leader: convert to follower
-		rf.checkTerm(reply.Term)
 		if rf.currentTerm != args.Term {
-			Debug(dWarn, "S%d Term has changed after the vote request, vote reply discarded."+
+			Debug(dWarn, "S%d Term has changed after the vote request, vote reply discarded. "+
 				"requestTerm: %d, currentTerm: %d.", rf.me, args.Term, rf.currentTerm)
 			return
 		}
+		// If AppendEntries RPC received from new leader: convert to follower
+		rf.checkTerm(reply.Term)
 		if reply.VoteGranted {
 			*voteCount++
 			Debug(dVote, "S%d <- S%d Get a yes vote at T%d.", rf.me, server, rf.currentTerm)
@@ -147,7 +147,7 @@ func (rf *Raft) candidateRequestVote(voteCount *int, args *RequestVoteArgs, once
 				once.Do(func() {
 					Debug(dLeader, "S%d Received majority votes at T%d. Become leader.", rf.me, rf.currentTerm)
 					rf.state = LeaderState
-					lastLogIndex, _ := rf.log.lastLogInfo()
+					lastLogIndex, _ := rf.lastLogInfo()
 					for peer := range rf.peers {
 						rf.nextIndex[peer] = lastLogIndex + 1
 						rf.matchIndex[peer] = 0

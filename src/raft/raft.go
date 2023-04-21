@@ -55,17 +55,29 @@ type Raft struct {
 
 	currentTerm int        // latest term server has seen
 	votedFor    int        // candidateId that received vote in current term
-	log         LogEntries // log entries; each entry contains command for state machine, and term when entry was received by leader
+	log         []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
 
 	// Volatile state on all servers
 
-	commitIndex int // index of highest log entry known to be committed
-	lastApplied int // index of highest log entry applied to state machine
+	commitIndex int           // index of highest log entry known to be committed
+	lastApplied int           // index of highest log entry applied to state machine
+	applyCh     chan ApplyMsg // the channel on which the tester or service expects Raft to send ApplyMsg messages
 
 	// Volatile state on leaders (Reinitialized after election)
 
 	nextIndex  []int // for each server, index of the next log entry to send to that server
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server
+
+	// Snapshot state on all servers
+	lastIncludedIndex int    // the snapshot replaces all entries up through and including this index, entire log up to the index discarded
+	lastIncludedTerm  int    // term of lastIncludedIndex
+	snapshot          []byte // snapshot stored in memory
+
+	// Temporary location to give the service snapshot to the apply thread
+	// All apply messages should be sent in one go routine, we need the temporary space for applyLogsLoop to handle the snapshot apply
+	waitingIndex    int    // lastIncludedIndex to be sent to applyCh
+	waitingTerm     int    // lastIncludedTerm to be sent to applyCh
+	waitingSnapshot []byte // snapshot to be sent to applyCh
 }
 
 // GetState returns currentTerm and whether this server
@@ -87,16 +99,48 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	if err := e.Encode(rf.currentTerm); err != nil {
-		Debug(dError, "Raft.readPersist: failed to decode \"rf.currentTerm\". err: %v, data: %v", err, rf.currentTerm)
+		Debug(dError, "Raft.persist: failed to encode \"rf.currentTerm\". err: %v, data: %v", err, rf.currentTerm)
 	}
 	if err := e.Encode(rf.votedFor); err != nil {
-		Debug(dError, "Raft.readPersist: failed to decode \"rf.votedFor\". err: %v, data: %v", err, rf.votedFor)
+		Debug(dError, "Raft.persist: failed to encode \"rf.votedFor\". err: %v, data: %v", err, rf.votedFor)
 	}
 	if err := e.Encode(rf.log); err != nil {
-		Debug(dError, "Raft.readPersist: failed to decode \"rf.log\". err: %v, data: %v", err, rf.log)
+		Debug(dError, "Raft.persist: failed to encode \"rf.log\". err: %v, data: %v", err, rf.log)
+	}
+	if err := e.Encode(rf.lastIncludedIndex); err != nil {
+		Debug(dError, "Raft.persist: failed to encode \"rf.lastIncludedIndex\". err: %v, data: %v", err, rf.lastIncludedIndex)
+	}
+	if err := e.Encode(rf.lastIncludedTerm); err != nil {
+		Debug(dError, "Raft.persist: failed to encode \"rf.lastIncludedTerm\". err: %v, data: %v", err, rf.lastIncludedTerm)
 	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+}
+
+// save Raft's persistent state and service snapshot to stable storage,
+// where they can later be retrieved after a crash and restart.
+func (rf *Raft) persistAndSnapshot(snapshot []byte) {
+	Debug(dSnap, "S%d Saving persistent state and service snapshot to stable storage at T%d.", rf.me, rf.currentTerm)
+	// Your code here (2C).
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(rf.currentTerm); err != nil {
+		Debug(dError, "Raft.persistAndSnapshot: failed to encode \"rf.currentTerm\". err: %v, data: %v", err, rf.currentTerm)
+	}
+	if err := e.Encode(rf.votedFor); err != nil {
+		Debug(dError, "Raft.persistAndSnapshot: failed to encode \"rf.votedFor\". err: %v, data: %v", err, rf.votedFor)
+	}
+	if err := e.Encode(rf.log); err != nil {
+		Debug(dError, "Raft.persistAndSnapshot: failed to encode \"rf.log\". err: %v, data: %v", err, rf.log)
+	}
+	if err := e.Encode(rf.lastIncludedIndex); err != nil {
+		Debug(dError, "Raft.persist: failed to encode \"rf.lastIncludedIndex\". err: %v, data: %v", err, rf.lastIncludedIndex)
+	}
+	if err := e.Encode(rf.lastIncludedTerm); err != nil {
+		Debug(dError, "Raft.persist: failed to encode \"rf.lastIncludedTerm\". err: %v, data: %v", err, rf.lastIncludedTerm)
+	}
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 // restore previously persisted state.
@@ -119,14 +163,37 @@ func (rf *Raft) readPersist(data []byte) {
 	if err := d.Decode(&rf.log); err != nil {
 		Debug(dError, "Raft.readPersist: failed to decode \"rf.log\". err: %v, data: %s", err, data)
 	}
+	if err := d.Decode(&rf.lastIncludedIndex); err != nil {
+		Debug(dError, "Raft.readPersist: failed to decode \"rf.lastIncludedIndex\". err: %v, data: %s", err, data)
+	}
+	if err := d.Decode(&rf.lastIncludedTerm); err != nil {
+		Debug(dError, "Raft.readPersist: failed to decode \"rf.lastIncludedTerm\". err: %v, data: %s", err, data)
+	}
 }
 
-// CondInstallSnapshot is a service that wants to switch to snapshot.  Only do so if Raft hasn't
-// had more recent info since it communicate the snapshot on applyCh.
+// CondInstallSnapshot returns if the service wants to switch to snapshot.
+// Only do so if Raft hasn't had more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debug(dSnap, "S%d Installing the snapshot. LLI: %d, LLT: %d", rf.me, lastIncludedIndex, lastIncludedTerm)
+	lastLogIndex, _ := rf.lastLogInfo()
+	if rf.commitIndex >= lastIncludedIndex {
+		Debug(dSnap, "S%d Log entries is already up-to-date with the snapshot. (%d >= %d)", rf.me, rf.commitIndex, lastIncludedIndex)
+		return false
+	}
+	if lastLogIndex >= lastIncludedIndex {
+		rf.log = rf.getSlice(lastIncludedIndex+1, lastLogIndex+1)
+	} else {
+		rf.log = []LogEntry{}
+	}
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+	rf.lastApplied = lastIncludedIndex
+	rf.commitIndex = lastIncludedIndex
+	rf.snapshot = snapshot
+	rf.persistAndSnapshot(snapshot)
 	return true
 }
 
@@ -136,7 +203,26 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	Debug(dSnap, "S%d Snapshotting through index %d.", rf.me, index)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	lastLogIndex, _ := rf.lastLogInfo()
+	if rf.lastIncludedIndex >= index {
+		Debug(dSnap, "S%d Snapshot already applied to persistent storage. (%d >= %d)", rf.me, rf.lastIncludedIndex, index)
+		return
+	}
+	if rf.commitIndex < index {
+		Debug(dWarn, "S%d Cannot snapshot uncommitted log entries, discard the call. (%d < %d)", rf.me, rf.commitIndex, index)
+		return
+	}
+	newLog := rf.getSlice(index+1, lastLogIndex+1)
+	newLastIncludeTerm := rf.getEntry(index).Term
 
+	rf.lastIncludedTerm = newLastIncludeTerm
+	rf.log = newLog
+	rf.lastIncludedIndex = index
+	rf.snapshot = snapshot
+	rf.persistAndSnapshot(snapshot)
 }
 
 // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
@@ -183,7 +269,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		Term:    rf.currentTerm,
 	}
 	rf.log = append(rf.log, logEntry)
-	index = len(rf.log)
+	index = len(rf.log) + rf.lastIncludedIndex
 	term = rf.currentTerm
 	Debug(dLog, "S%d Add command at T%d. LI: %d, Command: %v\n", rf.me, term, index, command)
 	rf.persist()
@@ -205,6 +291,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	Debug(dClient, "S%d Current client is exiting.", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -238,24 +325,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	for peer := range rf.peers {
+		rf.nextIndex[peer] = 1
+	}
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	for peer := range rf.peers {
-		rf.nextIndex[peer] = len(rf.log) + 1
-	}
-
-	lastLogIndex, lastLogTerm := rf.log.lastLogInfo()
+	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 	Debug(dClient, "S%d Started at T%d. LLI: %d, LLT: %d.", rf.me, rf.currentTerm, lastLogIndex, lastLogTerm)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	// Apply logs periodically until the last committed index to make sure state machine is up-to-date.
-	go rf.applyLogsLoop(applyCh)
+	go rf.applyLogsLoop()
 
 	return rf
 }

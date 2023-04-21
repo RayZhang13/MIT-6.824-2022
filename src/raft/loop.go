@@ -48,25 +48,38 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) applyLogsLoop(applyCh chan ApplyMsg) {
+func (rf *Raft) applyLogsLoop() {
 	for !rf.killed() {
 		// Apply logs periodically until the last committed index.
 		rf.mu.Lock()
 		// To avoid the apply operation getting blocked with the lock held,
 		// use a slice to store all committed messages to apply, and apply them only after unlocked
 		var appliedMsgs []ApplyMsg
-		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
+
+		rf.lastApplied = max(rf.lastApplied, rf.lastIncludedIndex)
+
+		if rf.waitingSnapshot != nil {
 			appliedMsgs = append(appliedMsgs, ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log.getEntry(rf.lastApplied).Command,
-				CommandIndex: rf.lastApplied,
+				SnapshotValid: true,
+				Snapshot:      rf.waitingSnapshot,
+				SnapshotTerm:  rf.waitingTerm,
+				SnapshotIndex: rf.waitingIndex,
 			})
-			Debug(dLog2, "S%d Applying log at T%d. LA: %d, CI: %d.", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
+			rf.waitingSnapshot = nil
+		} else {
+			for rf.commitIndex > rf.lastApplied {
+				rf.lastApplied++
+				appliedMsgs = append(appliedMsgs, ApplyMsg{
+					CommandValid: true,
+					Command:      rf.getEntry(rf.lastApplied).Command,
+					CommandIndex: rf.lastApplied,
+				})
+				Debug(dLog2, "S%d Applying log at T%d. LA: %d, CI: %d.", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
+			}
 		}
 		rf.mu.Unlock()
 		for _, msg := range appliedMsgs {
-			applyCh <- msg
+			rf.applyCh <- msg
 		}
 		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
 	}

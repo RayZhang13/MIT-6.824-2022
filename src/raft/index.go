@@ -5,73 +5,80 @@ import (
 	"math"
 )
 
-type LogEntries []LogEntry
-
 // LogEntry is a Go object implementing raft log entry
 type LogEntry struct {
-	Command interface{} // Command to be excuted
+	Command interface{} // Command to be executed
 	Term    int         // Term number when created
 }
 
 // Get the entry with the given index.
 // Index and term of *valid* entries start from 1.
 // If no *valid* entry is found, return an empty entry with term equal to -1.
-func (logEntries LogEntries) getEntry(index int) *LogEntry {
-	if index < 0 {
-		log.Panic("LogEntries.getEntry: index < 0.\n")
+// If log is too short, also return an empty entry with term equal to -1.
+// Panic if the index of the log entry is already in the snapshot and unable to get from memory.
+func (rf *Raft) getEntry(index int) *LogEntry {
+	logEntries := rf.log
+	logIndex := index - rf.lastIncludedIndex
+	if logIndex < 0 {
+		log.Panicf("LogEntries.getEntry: index too small. (%d < %d)", index, rf.lastIncludedIndex)
 	}
-	if index == 0 {
+	if logIndex == 0 {
 		return &LogEntry{
 			Command: nil,
-			Term:    0,
+			Term:    rf.lastIncludedTerm,
 		}
 	}
-	if index > len(logEntries) {
+	if logIndex > len(logEntries) {
 		return &LogEntry{
 			Command: nil,
 			Term:    -1,
 		}
 	}
-	return &logEntries[index-1]
+	return &logEntries[logIndex-1]
 }
 
 // Get the index and term of the last entry.
 // Return (0, 0) if the log is empty.
-func (logEntries LogEntries) lastLogInfo() (index, term int) {
-	index = len(logEntries)
-	logEntry := logEntries.getEntry(index)
+func (rf *Raft) lastLogInfo() (index, term int) {
+	logEntries := rf.log
+	index = len(logEntries) + rf.lastIncludedIndex
+	logEntry := rf.getEntry(index)
 	return index, logEntry.Term
 }
 
 // Get the slice of the log with index from startIndex to endIndex.
 // startIndex included and endIndex excluded, therefore startIndex should be no greater than endIndex.
-func (logEntries LogEntries) getSlice(startIndex, endIndex int) LogEntries {
-	if startIndex <= 0 {
+func (rf *Raft) getSlice(startIndex, endIndex int) []LogEntry {
+	logEntries := rf.log
+	logStartIndex := startIndex - rf.lastIncludedIndex
+	logEndIndex := endIndex - rf.lastIncludedIndex
+	if logStartIndex <= 0 {
 		Debug(dError, "LogEntries.getSlice: startIndex out of range. startIndex: %d, len: %d.",
 			startIndex, len(logEntries))
-		log.Panic("LogEntries.getSlice: startIndex out of range. \n")
+		log.Panicf("LogEntries.getSlice: startIndex out of range. (%d < %d)", startIndex, rf.lastIncludedIndex)
 	}
-	if endIndex > len(logEntries)+1 {
+	if logEndIndex > len(logEntries)+1 {
 		Debug(dError, "LogEntries.getSlice: endIndex out of range. endIndex: %d, len: %d.",
 			endIndex, len(logEntries))
-		log.Panic("LogEntries.getSlice: endIndex out of range.\n")
+		log.Panicf("LogEntries.getSlice: endIndex out of range. (%d > %d)", endIndex, len(logEntries)+1+rf.lastIncludedIndex)
 	}
-	if startIndex > endIndex {
+	if logStartIndex > logEndIndex {
 		Debug(dError, "LogEntries.getSlice: startIndex > endIndex. (%d > %d)", startIndex, endIndex)
-		log.Panic("LogEntries.getSlice: startIndex > endIndex.\n")
+		log.Panicf("LogEntries.getSlice: startIndex > endIndex. (%d > %d)", startIndex, endIndex)
 	}
-	return logEntries[startIndex-1 : endIndex-1]
+	return append([]LogEntry(nil), logEntries[logStartIndex-1:logEndIndex-1]...)
 }
 
 // Get the index of first entry and last entry with the given term.
 // Return (-1,-1) if no such term is found
-func (logEntries LogEntries) getBoundsWithTerm(term int) (minIndex int, maxIndex int) {
+func (rf *Raft) getBoundsWithTerm(term int) (minIndex int, maxIndex int) {
+	logEntries := rf.log
 	if term == 0 {
 		return 0, 0
 	}
 	minIndex, maxIndex = math.MaxInt, -1
-	for i := 1; i <= len(logEntries); i++ {
-		if logEntries.getEntry(i).Term == term {
+	for i := rf.lastIncludedIndex + 1; i <= rf.lastIncludedIndex+len(logEntries); i++ {
+		if rf.getEntry(i).Term == term {
 			minIndex = min(minIndex, i)
 			maxIndex = max(maxIndex, i)
 		}
